@@ -1,0 +1,152 @@
+---
+- name: Configure PingFederate 12.3 to use HA MySQL cluster
+  hosts: pingfederate_nodes
+  become: yes
+  vars:
+    # MySQL cluster hosts (used to construct HA JDBC URL)
+    mysql_hosts:
+      - "mysql-primary.example.com:3306"
+      - "mysql-replica1.example.com:3306"
+      - "mysql-replica2.example.com:3306"
+
+    # Host used for bootstrap operations (create DB/user/import schema)
+    mysql_bootstrap_host: "mysql-primary.example.com"
+
+    mysql_port: 3306
+    mysql_db: "pingfederate_db"
+    mysql_user: "pf_user"
+    mysql_password: "StrongPassword!"
+    mysql_root_user: "root"
+    mysql_root_password: "RootPassword!"
+    mysql_connector_version: "8.0.30"
+    pf_home: "/opt/pingfederate-12.3"
+
+    # Construct a load-balanced JDBC URL using MySQL Connector/J loadBalance host list.
+    # We use the loadBalance URL form so clients will round-robin or choose best-response host.
+    # See Connector/J docs for alternatives (replication:, failover:, etc.)
+    jdbc_url_prefix: "jdbc:mysql:loadbalance://"
+    # client URL query params (will be XML-escaped when inserted into file content)
+    jdbc_url_params: "useSSL=false&serverTimezone=UTC&loadBalanceStrategy=bestResponseTime"
+
+  pre_tasks:
+    - name: Build the JDBC host list and URL
+      set_fact:
+        jdbc_hosts_list: "{{ mysql_hosts | join(',') }}"
+        jdbc_url: "{{ jdbc_url_prefix }}{{ jdbc_hosts_list }}/{{ mysql_db }}?{{ jdbc_url_params }}"
+
+  tasks:
+    - name: Ensure MySQL DB exists (run against bootstrap host)
+      community.mysql.mysql_db:
+        login_host: "{{ mysql_bootstrap_host }}"
+        login_user: "{{ mysql_root_user }}"
+        login_password: "{{ mysql_root_password }}"
+        name: "{{ mysql_db }}"
+        state: present
+        encoding: utf8mb4
+        collation: utf8mb4_unicode_ci
+
+    - name: Ensure MySQL user exists (run against bootstrap host)
+      community.mysql.mysql_user:
+        login_host: "{{ mysql_bootstrap_host }}"
+        login_user: "{{ mysql_root_user }}"
+        login_password: "{{ mysql_root_password }}"
+        name: "{{ mysql_user }}"
+        password: "{{ mysql_password }}"
+        priv: "{{ mysql_db }}.*:ALL"
+        host: "%"
+        state: present
+
+    - name: Download MySQL Connector/J tarball
+      get_url:
+        url: "https://dev.mysql.com/get/Downloads/Connector-J/mysql-connector-j-{{ mysql_connector_version }}.tar.gz"
+        dest: "/tmp/mysql-connector-j-{{ mysql_connector_version }}.tar.gz"
+        mode: '0644'
+
+    - name: Extract JDBC driver tarball
+      unarchive:
+        src: "/tmp/mysql-connector-j-{{ mysql_connector_version }}.tar.gz"
+        dest: "/tmp/"
+        remote_src: yes
+
+    - name: Copy MySQL Connector JAR to PingFederate lib
+      copy:
+        # path inside extracted archive; Connector distribution has a folder like mysql-connector-j-8.0.30/
+        src: "/tmp/mysql-connector-j-{{ mysql_connector_version }}/mysql-connector-j-{{ mysql_connector_version }}.jar"
+        dest: "{{ pf_home }}/server/default/lib/"
+        mode: '0644'
+      # if the jar path differs on your tarball, update src accordingly
+
+    - name: Ensure config-store directory exists
+      file:
+        path: "{{ pf_home }}/server/default/data/config-store"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create JDBC datastore XML (HA JDBC URL)
+      copy:
+        dest: "{{ pf_home }}/server/default/data/config-store/data-store-mysql.xml"
+        content: |
+          <map>
+            <entry key="id" value="mysql-ds"/>
+            <entry key="name" value="MySQL HA Datastore"/>
+            <entry key="driver" value="com.mysql.cj.jdbc.Driver"/>
+            <!-- Note: &amp; is used to XML-escape & in the URL -->
+            <entry key="url" value="{{ jdbc_url | replace('&','&amp;') }}"/>
+            <entry key="user" value="{{ mysql_user }}"/>
+            <entry key="password" value="{{ mysql_password }}"/>
+            <entry key="validationQuery" value="SELECT 1"/>
+          </map>
+        mode: '0644'
+
+    - name: Configure Cluster State Service to use the MySQL datastore
+      copy:
+        dest: "{{ pf_home }}/server/default/data/config-store/cluster-state-service.xml"
+        content: |
+          <map>
+            <entry key="dataStore" value="mysql-ds"/>
+          </map>
+        mode: '0644'
+
+    - name: Configure OAuth Persistent Grants to use MySQL datastore
+      copy:
+        dest: "{{ pf_home }}/server/default/data/config-store/org.sourceid.oauth20.domain.PersistentGrantManagerJdbcImpl.xml"
+        content: |
+          <map>
+            <entry key="dataStore" value="mysql-ds"/>
+          </map>
+        mode: '0644'
+
+    - name: Import PingFederate MySQL schema (run against bootstrap host)
+      community.mysql.mysql_db:
+        login_host: "{{ mysql_bootstrap_host }}"
+        login_user: "{{ mysql_user }}"
+        login_password: "{{ mysql_password }}"
+        name: "{{ mysql_db }}"
+        state: import
+        # adjust path if your PingFederate distro puts the MySQL schema in a different path
+        target: "{{ pf_home }}/server/default/conf/database/mysql/schema-mysql.sql"
+
+    - name: Ensure PingFederate service file exists and is enabled (systemd)
+      # This task assumes you have a systemd unit named 'pingfederate'; if not, adapt or use pingfederate.sh directly
+      systemd:
+        name: pingfederate
+        enabled: yes
+        state: started
+      ignore_errors: yes
+
+    - name: Restart PingFederate via service if available
+      systemd:
+        name: pingfederate
+        state: restarted
+      when: ansible_facts.services is defined and 'pingfederate' in ansible_facts.services
+      ignore_errors: yes
+
+    - name: Fall back - restart PingFederate using script if systemd unit not present
+      shell: "{{ pf_home }}/bin/pingfederate.sh restart"
+      args:
+        executable: /bin/bash
+      when: ansible_facts.services is not defined or 'pingfederate' not in ansible_facts.services
+
+  handlers: []
