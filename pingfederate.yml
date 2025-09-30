@@ -1,5 +1,5 @@
 ---
-- name: Configure PingFederate to use MySQL backend
+- name: Configure PingFederate 12.3 with MySQL backend
   hosts: pingfederate_nodes
   become: yes
   vars:
@@ -8,12 +8,34 @@
     mysql_db: "pingfederate_db"
     mysql_user: "pf_user"
     mysql_password: "StrongPassword!"
+    mysql_root_user: "root"
+    mysql_root_password: "RootPassword!"
     mysql_connector_version: "8.0.30"
     pf_home: "/opt/pingfederate-12.3"
 
   tasks:
+    - name: Ensure MySQL DB exists
+      community.mysql.mysql_db:
+        login_host: "{{ mysql_host }}"
+        login_user: "{{ mysql_root_user }}"
+        login_password: "{{ mysql_root_password }}"
+        name: "{{ mysql_db }}"
+        state: present
+        encoding: utf8mb4
+        collation: utf8mb4_unicode_ci
 
-    - name: Ensure MySQL JDBC driver is present
+    - name: Ensure MySQL user exists
+      community.mysql.mysql_user:
+        login_host: "{{ mysql_host }}"
+        login_user: "{{ mysql_root_user }}"
+        login_password: "{{ mysql_root_password }}"
+        name: "{{ mysql_user }}"
+        password: "{{ mysql_password }}"
+        priv: "{{ mysql_db }}.*:ALL"
+        host: "%"
+        state: present
+
+    - name: Download MySQL JDBC driver
       get_url:
         url: "https://dev.mysql.com/get/Downloads/Connector-J/mysql-connector-j-{{ mysql_connector_version }}.tar.gz"
         dest: "/tmp/mysql-connector.tar.gz"
@@ -30,18 +52,35 @@
         dest: "{{ pf_home }}/server/default/lib/"
         mode: '0644'
 
-    - name: Update run.properties for MySQL
-      lineinfile:
-        path: "{{ pf_home }}/server/default/conf/run.properties"
-        regexp: "{{ item.regexp }}"
-        line: "{{ item.line }}"
-        backrefs: yes
-      with_items:
-        - { regexp: '^pf.cluster.database.type=.*', line: 'pf.cluster.database.type=mysql' }
-        - { regexp: '^pf.cluster.database.driver=.*', line: 'pf.cluster.database.driver=com.mysql.cj.jdbc.Driver' }
-        - { regexp: '^pf.cluster.database.url=.*', line: 'pf.cluster.database.url=jdbc:mysql://{{ mysql_host }}:{{ mysql_port }}/{{ mysql_db }}?useSSL=false&serverTimezone=UTC' }
-        - { regexp: '^pf.cluster.database.user=.*', line: 'pf.cluster.database.user={{ mysql_user }}' }
-        - { regexp: '^pf.cluster.database.password=.*', line: 'pf.cluster.database.password={{ mysql_password }}' }
+    - name: Create JDBC datastore config
+      copy:
+        dest: "{{ pf_home }}/server/default/data/config-store/data-store-mysql.xml"
+        content: |
+          <map>
+            <entry key="id" value="mysql-ds"/>
+            <entry key="name" value="MySQL Datastore"/>
+            <entry key="driver" value="com.mysql.cj.jdbc.Driver"/>
+            <entry key="url" value="jdbc:mysql://{{ mysql_host }}:{{ mysql_port }}/{{ mysql_db }}?useSSL=false&amp;serverTimezone=UTC"/>
+            <entry key="user" value="{{ mysql_user }}"/>
+            <entry key="password" value="{{ mysql_password }}"/>
+            <entry key="validationQuery" value="SELECT 1"/>
+          </map>
+
+    - name: Configure Cluster State Service to use MySQL
+      copy:
+        dest: "{{ pf_home }}/server/default/data/config-store/cluster-state-service.xml"
+        content: |
+          <map>
+            <entry key="dataStore" value="mysql-ds"/>
+          </map>
+
+    - name: Configure OAuth Persistent Grants to use MySQL
+      copy:
+        dest: "{{ pf_home }}/server/default/data/config-store/org.sourceid.oauth20.domain.PersistentGrantManagerJdbcImpl.xml"
+        content: |
+          <map>
+            <entry key="dataStore" value="mysql-ds"/>
+          </map>
 
     - name: Import PingFederate schema into MySQL
       community.mysql.mysql_db:
@@ -50,7 +89,7 @@
         login_password: "{{ mysql_password }}"
         name: "{{ mysql_db }}"
         state: import
-        target: "{{ pf_home }}/server/default/conf/database/schema.mysql.sql"
+        target: "{{ pf_home }}/server/default/conf/database/mysql/schema-mysql.sql"
 
     - name: Restart PingFederate
       systemd:
