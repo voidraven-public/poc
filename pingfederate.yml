@@ -1,0 +1,59 @@
+---
+- name: Configure PingFederate to use MySQL backend
+  hosts: pingfederate_nodes
+  become: yes
+  vars:
+    mysql_host: "db.example.com"
+    mysql_port: 3306
+    mysql_db: "pingfederate_db"
+    mysql_user: "pf_user"
+    mysql_password: "StrongPassword!"
+    mysql_connector_version: "8.0.30"
+    pf_home: "/opt/pingfederate-12.3"
+
+  tasks:
+
+    - name: Ensure MySQL JDBC driver is present
+      get_url:
+        url: "https://dev.mysql.com/get/Downloads/Connector-J/mysql-connector-j-{{ mysql_connector_version }}.tar.gz"
+        dest: "/tmp/mysql-connector.tar.gz"
+
+    - name: Extract JDBC driver
+      unarchive:
+        src: "/tmp/mysql-connector.tar.gz"
+        dest: "/tmp/"
+        remote_src: yes
+
+    - name: Copy JDBC jar to PingFederate lib
+      copy:
+        src: "/tmp/mysql-connector-j-{{ mysql_connector_version }}/mysql-connector-j-{{ mysql_connector_version }}.jar"
+        dest: "{{ pf_home }}/server/default/lib/"
+        mode: '0644'
+
+    - name: Update run.properties for MySQL
+      lineinfile:
+        path: "{{ pf_home }}/server/default/conf/run.properties"
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        backrefs: yes
+      with_items:
+        - { regexp: '^pf.cluster.database.type=.*', line: 'pf.cluster.database.type=mysql' }
+        - { regexp: '^pf.cluster.database.driver=.*', line: 'pf.cluster.database.driver=com.mysql.cj.jdbc.Driver' }
+        - { regexp: '^pf.cluster.database.url=.*', line: 'pf.cluster.database.url=jdbc:mysql://{{ mysql_host }}:{{ mysql_port }}/{{ mysql_db }}?useSSL=false&serverTimezone=UTC' }
+        - { regexp: '^pf.cluster.database.user=.*', line: 'pf.cluster.database.user={{ mysql_user }}' }
+        - { regexp: '^pf.cluster.database.password=.*', line: 'pf.cluster.database.password={{ mysql_password }}' }
+
+    - name: Import PingFederate schema into MySQL
+      community.mysql.mysql_db:
+        login_host: "{{ mysql_host }}"
+        login_user: "{{ mysql_user }}"
+        login_password: "{{ mysql_password }}"
+        name: "{{ mysql_db }}"
+        state: import
+        target: "{{ pf_home }}/server/default/conf/database/schema.mysql.sql"
+
+    - name: Restart PingFederate
+      systemd:
+        name: pingfederate
+        state: restarted
+        enabled: yes
